@@ -49,7 +49,7 @@ jobs:
 
       - name: Prepare Agents
         id: agents
-        uses: svierk/sfdx-agent-deploy@v1.0.0
+        uses: svierk/sfdx-agent-deploy@v1.0.1
         with:
           phase: prepare
           source-dir: force-app
@@ -63,7 +63,7 @@ jobs:
           target-org: awesome-org
 
       - name: Deploy Agents
-        uses: svierk/sfdx-agent-deploy@v1.0.0
+        uses: svierk/sfdx-agent-deploy@v1.0.1
         with:
           source-dir: force-app
           target-org: awesome-org
@@ -80,7 +80,7 @@ The following actions were also used in the example workflow to create the prere
 ```yaml
 - name: Prepare Agents
   id: agents
-  uses: svierk/sfdx-agent-deploy@v1.0.0
+  uses: svierk/sfdx-agent-deploy@v1.0.1
   with:
     phase: prepare
     target-org: ci
@@ -94,7 +94,7 @@ The following actions were also used in the example workflow to create the prere
     dry-run: true
 
 - name: Validate Agents
-  uses: svierk/sfdx-agent-deploy@v1.0.0
+  uses: svierk/sfdx-agent-deploy@v1.0.1
   with:
     target-org: ci
     dry-run: true
@@ -154,7 +154,7 @@ The action uses `--skip-retrieve` when publishing, as CI would only download the
 
 ## Prerequisites
 
-- **Connected app:** with the JWT flow, the connected app needs the OAuth scopes `chatbot_api`, `sfap_api` and `web`, next to `api` and `refresh_token`. The CLI uses them to reach the agent APIs.
+- **OAuth scopes:** with the JWT flow, the connected app or external client app needs the scope `web`, next to `api` and `refresh_token`. The CLI uses it to reach the agent APIs when it validates, publishes and activates an agent.
 - **Target org:** Einstein and Agentforce enabled, and an integration user with the permissions to publish agents.
 - **API version:** `"sourceApiVersion": "68.0"` in `sfdx-project.json`. The `AiAgentDefinition` types need it.
 - **Values per org:** a service agent names its agent user in the script. Use a `replaceWithEnv` [string replacement](https://developer.salesforce.com/docs/ai/agentforce/guide/agent-dx-deploy-metadata.html) in `sfdx-project.json` and set the variable on the steps of both this action and SFDX Deploy. The comparison with the org applies these replacements too; a `replaceWithFile` replacement can't be compared, so that script is published on every run.
