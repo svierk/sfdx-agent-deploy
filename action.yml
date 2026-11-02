@@ -138,7 +138,7 @@ runs:
         extract_json() { awk '/^[[:space:]]*\{/{f=1} f'; }
 
         # Reads the error of a failed `sf ... --json` call. The agent APIs of the
-        # org need scopes that a connected app for plain deployments doesn't have,
+        # org need a scope that an app for plain deployments doesn't have,
         # and the CLI only says so in a nested field - name the fix here.
         report_cli_error() {
           local what="$1" json="$2" name message
@@ -149,7 +149,7 @@ runs:
           echo "::error::${what}: ${message//$'\n'/ }"
           case "$name" in
             ApiAccessError | InvalidJwtToken)
-              echo "::error::The agent APIs could not be reached. If this persists, check the connected app used for the login: it needs the OAuth scopes chatbot_api, sfap_api and web in addition to api and refresh_token."
+              echo "::error::The agent APIs could not be reached. If this persists, check the connected app or external client app used for the login: it needs the OAuth scope web in addition to api and refresh_token."
               ;;
           esac
         }
@@ -445,7 +445,9 @@ runs:
             for path in "${follow_up[@]}"; do
               args+=(--source-dir "$path")
             done
-            result=$(sf project deploy start --json --wait "$WAIT" "${args[@]}" ${org_args[@]+"${org_args[@]}"} 2>/dev/null | extract_json)
+            # A CI checkout has no source tracking data, so in a tracked org every earlier
+            # deployment of these files would look like a conflict.
+            result=$(sf project deploy start --json --ignore-conflicts --wait "$WAIT" "${args[@]}" ${org_args[@]+"${org_args[@]}"} 2>/dev/null | extract_json)
             if echo "$result" | jq -e '.result.success == true' >/dev/null 2>&1; then
               echo "✅ Deployed after the publish"
               follow_up_state="✅ Deployed"
