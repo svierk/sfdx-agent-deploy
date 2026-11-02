@@ -1,0 +1,501 @@
+name: SFDX Agent Deploy
+description: GitHub composite action to publish, activate and validate Agentforce agents and deploy their tests to a target org.
+
+branding:
+  icon: cpu
+  color: blue
+
+inputs:
+  phase:
+    description: >
+      Which part of the agent deployment to run. "prepare" runs BEFORE sfdx-deploy and outputs the
+      patterns the metadata deployment has to leave out. "publish" runs AFTER it and publishes,
+      activates (or, on a dry-run, validates) the agents and deploys their tests.
+    required: false
+    default: publish
+  source-dir:
+    description: Source directories to look for agents and agent tests in, as a comma-separated or multi-line list, e.g. "force-app,my-other-app".
+    required: false
+    default: force-app
+  target-org:
+    description: Username or alias of the target org. Not required if the default org is already set.
+    required: false
+  dry-run:
+    description: Only compile the Agent Script of the authoring bundles. Nothing is saved to the org, nothing is activated and no tests are deployed.
+    required: false
+    default: 'false'
+  activate:
+    description: Activate the agent versions after publishing. Set to false to leave the currently active versions in place.
+    required: false
+    default: 'true'
+  deploy-tests:
+    description: Deploy the agent test definitions (AiEvaluationDefinition, AiTestingDefinition) once the agents exist in the org.
+    required: false
+    default: 'true'
+  post-publish-dir:
+    description: >
+      Further source directories to deploy once the agents exist in the org, as a comma-separated or multi-line list.
+      For metadata that references a published agent, like a permission set granting access to it. Keep them outside
+      of the source deployed before the publish, which would fail on the missing agent.
+    required: false
+  wait:
+    description: Number of minutes to wait for the deployment of the agent tests and the post-publish directories to complete.
+    required: false
+    default: '33'
+  api-version:
+    description: Override the api version used for api requests made by this action, for example '68.0'.
+    required: false
+  step-summary:
+    description: Write a result section to the GitHub Actions job summary. Set to false to avoid collisions with a custom workflow summary.
+    required: false
+    default: 'true'
+
+outputs:
+  exclude:
+    description: Comma-separated patterns for the "exclude" input of sfdx-deploy (phase "prepare"), empty if nothing has to be left out.
+    value: ${{ steps.agents.outputs.exclude }}
+  status:
+    description: Overall result - "Skipped" (no agents or agent tests in the source), "Prepared", "Validated", "Deployed" or "Failed".
+    value: ${{ steps.agents.outputs.status }}
+  published:
+    description: Comma-separated API names of the agents a new version was published for.
+    value: ${{ steps.agents.outputs.published }}
+  unchanged:
+    description: Comma-separated API names of the agents whose Agent Script matches the latest version in the org, so nothing was published.
+    value: ${{ steps.agents.outputs.unchanged }}
+  activated:
+    description: Comma-separated "name vN" entries of the agent versions that are active after this run.
+    value: ${{ steps.agents.outputs.activated }}
+
+runs:
+  using: composite
+  steps:
+    - name: Deploy Agents
+      id: agents
+      shell: bash
+      env:
+        PHASE: ${{ inputs.phase }}
+        SOURCE_DIR: ${{ inputs.source-dir }}
+        TARGET_ORG: ${{ inputs.target-org }}
+        DRY_RUN: ${{ inputs.dry-run }}
+        ACTIVATE: ${{ inputs.activate }}
+        DEPLOY_TESTS: ${{ inputs.deploy-tests }}
+        POST_PUBLISH_DIR: ${{ inputs.post-publish-dir }}
+        WAIT: ${{ inputs.wait }}
+        API_VERSION: ${{ inputs.api-version }}
+        STEP_SUMMARY: ${{ inputs.step-summary }}
+      run: |
+        set -uo pipefail
+
+        # The exit status is managed through `failed`, so disable errexit (GitHub
+        # runs composite shells with `-e` by default). A failure on one agent
+        # still lets the others run and the job summary render.
+        set +e
+
+        failed=false
+
+        org_args=()
+        [[ -n "$TARGET_ORG" ]] && org_args+=(--target-org "$TARGET_ORG")
+        [[ -n "$API_VERSION" ]] && org_args+=(--api-version "$API_VERSION")
+
+        # Splits a comma- or newline-separated input into the global SPLIT array
+        # and trims the surrounding whitespace, so that both notations work:
+        #   source-dir: 'force-app,my-other-app'
+        #   source-dir: |
+        #     force-app
+        #     my-other-app
+        split_list() {
+          SPLIT=()
+          local raw item
+          raw="${1//,/$'\n'}"
+          while IFS= read -r item; do
+            item="${item#"${item%%[![:space:]]*}"}"
+            item="${item%"${item##*[![:space:]]}"}"
+            if [[ -n "$item" ]]; then
+              SPLIT+=("$item")
+            fi
+          done <<< "$raw"
+        }
+
+        # Joins the remaining arguments with commas.
+        join_list() {
+          local IFS=,
+          echo "$*"
+        }
+
+        # True when the first argument equals one of the remaining ones.
+        contains() {
+          local needle="$1" item
+          shift
+          for item in "$@"; do
+            [[ "$item" == "$needle" ]] && return 0
+          done
+          return 1
+        }
+
+        # Extract the JSON object from CLI output that may be prefixed with
+        # npm/plugin noise. Keeps everything from the first line starting with "{".
+        extract_json() { awk '/^[[:space:]]*\{/{f=1} f'; }
+
+        # Reads the error of a failed `sf ... --json` call. The agent APIs of the
+        # org need scopes that a connected app for plain deployments doesn't have,
+        # and the CLI only says so in a nested field - name the fix here.
+        report_cli_error() {
+          local what="$1" json="$2" name message
+          name=$(echo "$json" | jq -r '.name // empty' 2>/dev/null)
+          message=$(echo "$json" | jq -r '.message // empty' 2>/dev/null)
+          [[ -n "$message" ]] || message="$json"
+          echo "❌ ${what}: ${name:+$name - }$message"
+          echo "::error::${what}: ${message//$'\n'/ }"
+          case "$name" in
+            ApiAccessError | InvalidJwtToken)
+              echo "::error::The agent APIs could not be reached. If this persists, check the connected app used for the login: it needs the OAuth scopes chatbot_api, sfap_api and web in addition to api and refresh_token."
+              ;;
+          esac
+        }
+
+        # ----------------------------- Discovery ------------------------------
+        # An authoring bundle without a target is a draft, the only kind that can
+        # be published. Everything else that describes an agent - AiAgentDefinition,
+        # Bot, a bundle with a target - is compiled metadata, which the regular
+        # deployment carries. A draft bundle wins over compiled files of its agent:
+        # those versions belong to the org they were retrieved from.
+        split_list "$SOURCE_DIR"
+        sources=()
+        for dir in ${SPLIT[@]+"${SPLIT[@]}"}; do
+          if [[ -d "$dir" ]]; then
+            sources+=("$dir")
+          else
+            echo "::notice::Source directory '$dir' does not exist - no agents to look for there."
+          fi
+        done
+
+        # Lists the files matching the given `find` expression in all sources.
+        find_sources() {
+          [[ ${#sources[@]} -gt 0 ]] || return 0
+          find "${sources[@]}" -type f -not -path '*/node_modules/*' "$@" | sort
+        }
+
+        drafts=()
+        while IFS= read -r meta; do
+          [[ -n "$meta" ]] || continue
+          grep -q '<target>' "$meta" || drafts+=("$(basename "$(dirname "$meta")")")
+        done < <(find_sources -path '*/aiAuthoringBundles/*' -name '*.bundle-meta.xml')
+
+        compiled=()
+        while IFS= read -r meta; do
+          [[ -n "$meta" ]] || continue
+          case "$meta" in
+            *.aiAgentDefinition-meta.xml) name="$(basename "$meta" .aiAgentDefinition-meta.xml)" ;;
+            *) name="$(basename "$meta" .bot-meta.xml)" ;;
+          esac
+          if ! contains "$name" ${drafts[@]+"${drafts[@]}"} ${compiled[@]+"${compiled[@]}"}; then
+            compiled+=("$name")
+          fi
+        done < <(find_sources \( -path '*/aiAgents/*.aiAgentDefinition-meta.xml' -o -path '*/bots/*.bot-meta.xml' \))
+
+        test_files=()
+        while IFS= read -r meta; do
+          [[ -n "$meta" ]] && test_files+=("$meta")
+        done < <(find_sources \( -name '*.aiEvaluationDefinition-meta.xml' -o -name '*.aiTestingDefinition-meta.xml' \))
+
+        if [[ ${#drafts[@]} -eq 0 && ${#compiled[@]} -eq 0 && ${#test_files[@]} -eq 0 ]]; then
+          echo "ℹ️ No agents or agent tests in the source - skipping."
+          {
+            echo "exclude="
+            echo "status=Skipped"
+            echo "published="
+            echo "unchanged="
+            echo "activated="
+          } >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # Highest version of a compiled agent held in the source, empty if none.
+        latest_source_version() {
+          find_sources \( -path "*/aiAgentDefinitionVersions/$1#*" -o -path "*/bots/$1/v*.botVersion-meta.xml" \) \
+            | sed -nE "s|.*/aiAgentDefinitionVersions/$1#([0-9]+)/.*|\1|p; s|.*/bots/$1/v([0-9]+)\.botVersion-meta\.xml|\1|p" \
+            | sort -n | tail -n1
+        }
+
+        # ------------------------------ Prepare -------------------------------
+        if [[ "$PHASE" == "prepare" ]]; then
+          exclude=()
+
+          # A test definition fails the whole deployment while its agent has no
+          # version in the org ("BotVersion not found"), and a new agent only gets
+          # one when it is published after the deployment. So tests go in last.
+          if [[ ${#test_files[@]} -gt 0 ]]; then
+            exclude+=('**/aiEvaluationDefinitions/**' '**/aiTestingDefinitions/**')
+          fi
+
+          # Compiled files of an agent with a draft bundle: the publish creates the
+          # versions of this org, whatever another org numbered them.
+          for name in ${drafts[@]+"${drafts[@]}"}; do
+            if [[ -n "$(find_sources -path "*/aiAgents/$name.aiAgentDefinition-meta.xml")" ]]; then
+              exclude+=("**/aiAgents/$name.aiAgentDefinition-meta.xml")
+            fi
+            if [[ -n "$(find_sources -path "*/aiAgentDefinitionVersions/$name#*")" ]]; then
+              exclude+=("**/aiAgentDefinitionVersions/$name#*")
+            fi
+            if [[ -n "$(find_sources -path "*/bots/$name/*")" ]]; then
+              exclude+=("**/bots/$name")
+            fi
+            if [[ -n "$(find_sources -path "*/genAiPlannerBundles/${name}_v*")" ]]; then
+              exclude+=("**/genAiPlannerBundles/${name}_v*")
+            fi
+          done
+
+          # An active version can't be deployed, not even unchanged ("Can't edit an
+          # active bot version"), which fails every deployment after the first
+          # activation. Versions are immutable, so leaving it out loses nothing.
+          if [[ ${#compiled[@]} -gt 0 ]]; then
+            in_list=""
+            for name in "${compiled[@]}"; do
+              in_list+="${in_list:+,}'$name'"
+            done
+            result=$(sf data query --json ${org_args[@]+"${org_args[@]}"} \
+              --query "SELECT BotDefinition.DeveloperName, VersionNumber FROM BotVersion WHERE Status = 'Active' AND BotDefinition.DeveloperName IN ($in_list)" 2>/dev/null | extract_json)
+            if echo "$result" | jq -e '.status == 0' >/dev/null 2>&1; then
+              while IFS=$'\t' read -r name version; do
+                [[ -n "$name" ]] || continue
+                echo "ℹ️ $name v$version is active in the org and stays out of the deployment - active versions can't change, deploy a new version instead."
+                exclude+=("**/aiAgentDefinitionVersions/$name#$version" "**/bots/$name/v$version.botVersion-meta.xml" "**/genAiPlannerBundles/${name}_v$version")
+              done < <(echo "$result" | jq -r '.result.records[]? | [.BotDefinition.DeveloperName, .VersionNumber] | @tsv')
+            else
+              echo "::warning::Could not read the active agent versions of the org: $(echo "$result" | jq -r '.message // "unknown error"' 2>/dev/null)"
+            fi
+          fi
+
+          joined="$(join_list ${exclude[@]+"${exclude[@]}"})"
+          echo "Leaving out of the deployment: ${joined:-nothing}"
+          {
+            echo "exclude=$joined"
+            echo "status=Prepared"
+          } >> "$GITHUB_OUTPUT"
+          exit 0
+        elif [[ "$PHASE" != "publish" ]]; then
+          echo "::error::Unknown phase '$PHASE' - use 'prepare' or 'publish'."
+          exit 1
+        fi
+
+        # ------------------------------- Publish ------------------------------
+        published=(); unchanged=(); activated=(); rows=()
+
+        # Writes the script as the org would hold it to the file $2: `sf agent
+        # publish` applies the replacements of sfdx-project.json, e.g. the agent
+        # user of the org. `replaceWithFile` isn't resolved here, so such a script
+        # always counts as changed.
+        render_script() {
+          if [[ -f sfdx-project.json ]]; then
+            jq -Rjs --slurpfile project sfdx-project.json '
+              reduce ($project[0].replacements // [] | .[]) as $r (.;
+                if $r.replaceWithEnv == null then .
+                else
+                  (env[$r.replaceWithEnv] // "") as $value
+                  | if $r.stringToReplace != null then (split($r.stringToReplace) | join($value))
+                    elif $r.regexToReplace != null then gsub($r.regexToReplace; $value)
+                    else . end
+                end)' "$1" > "$2"
+          else
+            cp "$1" "$2"
+          fi
+        }
+
+        # Every publish creates a new agent version, changed or not, and a pipeline
+        # that runs on each push would pile them up. So look up the latest published
+        # version: the org keeps a copy of the script per version as bundle "Name_N".
+        # The newest one may still be an unpublished draft, recognizable by its
+        # missing target. Sets ORG_VERSION; returns 0 when the script is unchanged.
+        script_unchanged() {
+          local name="$1" script="$2" work bundle target snapshot rendered result
+          ORG_VERSION=""
+          result=$(sf org list metadata --metadata-type AiAuthoringBundle --json ${org_args[@]+"${org_args[@]}"} 2>/dev/null | extract_json)
+          work="$(mktemp -d)"
+          rendered="$work/rendered.agent"
+          render_script "$script" "$rendered"
+          while IFS= read -r bundle; do
+            [[ -n "$bundle" ]] || continue
+            mkdir -p "$work/$bundle"
+            sf project retrieve start --metadata "AiAuthoringBundle:$bundle" --target-metadata-dir "$work/$bundle" --unzip --json \
+              ${org_args[@]+"${org_args[@]}"} >/dev/null 2>&1 || continue
+            target="$(find "$work/$bundle" -name '*.bundle-meta.xml' -exec sed -nE 's|.*<target>(.*)</target>.*|\1|p' {} + | head -n1)"
+            [[ "$target" == "$name".v* ]] || continue
+            ORG_VERSION="${target##*.v}"
+            snapshot="$(find "$work/$bundle" -name '*.agent' | head -n1)"
+            [[ -n "$snapshot" ]] && cmp -s "$snapshot" "$rendered"
+            return $?
+          done < <(echo "$result" | jq -r --arg name "$name" '
+            [.result | if type == "array" then .[] elif type == "object" then . else empty end | .fullName]
+            | map(select(test("^" + $name + "_[0-9]+$")))
+            | sort_by(split("_") | last | tonumber) | reverse | .[]' 2>/dev/null)
+          return 1
+        }
+
+        # Activates a version (the latest one without $2). Only one version of an
+        # agent can be active, so the org deactivates the previous one by itself.
+        # A repeated activation of the active version is fine.
+        activate_agent() {
+          local name="$1" version="${2:-}" args result active
+          args=(--api-name "$name" --json)
+          [[ -n "$version" ]] && args+=(--version "$version")
+          result=$(sf agent activate "${args[@]}" ${org_args[@]+"${org_args[@]}"} 2>/dev/null | extract_json)
+          if ! echo "$result" | jq -e '.result.success == true' >/dev/null 2>&1; then
+            report_cli_error "Activating $name failed" "$result"
+            return 1
+          fi
+          active=$(echo "$result" | jq -r '.result.version')
+          echo "✅ $name: version $active is active"
+          activated+=("$name v$active")
+          ACTIVE_VERSION="$active"
+        }
+
+        for name in ${drafts[@]+"${drafts[@]}"}; do
+          if [[ "$DRY_RUN" == "true" ]]; then
+            echo "▶️ Validating the Agent Script of $name..."
+            result=$(sf agent validate authoring-bundle --api-name "$name" --json ${org_args[@]+"${org_args[@]}"} 2>/dev/null | extract_json)
+            if echo "$result" | jq -e '.result.success == true' >/dev/null 2>&1; then
+              echo "✅ $name: Agent Script compiles"
+              rows+=("| \`$name\` | 🔍 Validated | - |")
+            else
+              report_cli_error "Validating $name failed" "$result"
+              rows+=("| \`$name\` | ❌ Invalid | - |")
+              failed=true
+            fi
+            continue
+          fi
+
+          script="$(find_sources -path "*/aiAuthoringBundles/$name/$name.agent" | head -n1)"
+          ACTIVE_VERSION=""
+          version=""
+          if [[ -n "$script" ]] && script_unchanged "$name" "$script"; then
+            echo "ℹ️ $name: Agent Script matches version $ORG_VERSION in the org - nothing to publish."
+            unchanged+=("$name")
+            version="$ORG_VERSION"
+            state="⚪ Unchanged"
+          else
+            echo "▶️ Publishing $name..."
+            # --skip-retrieve: the compiled metadata isn't committed back, CI would
+            # only download it into a workspace that is thrown away.
+            result=$(sf agent publish authoring-bundle --api-name "$name" --skip-retrieve --json ${org_args[@]+"${org_args[@]}"} 2>/dev/null | extract_json)
+            if ! echo "$result" | jq -e '.result.success == true' >/dev/null 2>&1; then
+              report_cli_error "Publishing $name failed" "$result"
+              rows+=("| \`$name\` | ❌ Failed | - |")
+              failed=true
+              continue
+            fi
+            echo "✅ $name: published a new version"
+            published+=("$name")
+            state="🟢 Published"
+          fi
+
+          if [[ "$ACTIVATE" == "true" ]]; then
+            if ! activate_agent "$name" "$version"; then
+              rows+=("| \`$name\` | $state, ❌ activation failed | - |")
+              failed=true
+              continue
+            fi
+          fi
+          rows+=("| \`$name\` | $state | ${ACTIVE_VERSION:+v$ACTIVE_VERSION} |")
+        done
+
+        # Compiled agents arrived with the regular deployment, they only need their
+        # newest version switched on. Skipped on a dry-run, which saved nothing.
+        if [[ "$DRY_RUN" != "true" ]]; then
+          for name in ${compiled[@]+"${compiled[@]}"}; do
+            ACTIVE_VERSION=""
+            state="📦 Deployed"
+            if [[ "$ACTIVATE" == "true" ]]; then
+              if ! activate_agent "$name" "$(latest_source_version "$name")"; then
+                rows+=("| \`$name\` | $state, ❌ activation failed | - |")
+                failed=true
+                continue
+              fi
+            fi
+            rows+=("| \`$name\` | $state | ${ACTIVE_VERSION:+v$ACTIVE_VERSION} |")
+          done
+        fi
+
+        # --------------------------- After the publish ------------------------
+        # What needs the agents in the org: the test definitions and whatever else
+        # the project names, e.g. a permission set that grants access to an agent.
+        follow_up=()
+        if [[ "$DEPLOY_TESTS" == "true" ]]; then
+          follow_up+=(${test_files[@]+"${test_files[@]}"})
+        fi
+        split_list "$POST_PUBLISH_DIR"
+        follow_up+=(${SPLIT[@]+"${SPLIT[@]}"})
+
+        follow_up_state=""
+        if [[ ${#follow_up[@]} -gt 0 && "$DRY_RUN" != "true" ]]; then
+          if [[ "$failed" == "true" ]]; then
+            echo "::warning::Not deploying the agent tests and post-publish directories because an agent could not be brought to the org."
+            follow_up_state="⚠️ Not deployed"
+          else
+            # A version number means something else in every org, because each org
+            # counts its own publishes. Without one, the active version is tested.
+            for meta in ${test_files[@]+"${test_files[@]}"}; do
+              if grep -q '<subjectVersion>' "$meta"; then
+                echo "::warning file=$meta::$(basename "$meta") pins a subjectVersion, but version numbers differ between orgs. Remove it to test the active version."
+              fi
+            done
+
+            echo "▶️ Deploying what needs the published agents: ${follow_up[*]}"
+            args=()
+            for path in "${follow_up[@]}"; do
+              args+=(--source-dir "$path")
+            done
+            result=$(sf project deploy start --json --wait "$WAIT" "${args[@]}" ${org_args[@]+"${org_args[@]}"} 2>/dev/null | extract_json)
+            if echo "$result" | jq -e '.result.success == true' >/dev/null 2>&1; then
+              echo "✅ Deployed after the publish"
+              follow_up_state="✅ Deployed"
+            else
+              echo "$result" | jq -r '
+                [.result.details.componentFailures? | if type == "array" then .[] else . end | select(. != null)]
+                | .[] | "❌ \(.fullName // "-"): \((.problem // "-") | gsub("\n"; " "))"' 2>/dev/null
+              report_cli_error "The deployment after the publish failed" "$result"
+              follow_up_state="❌ Failed"
+              failed=true
+            fi
+          fi
+        fi
+
+        # ------------------------------- Outputs ------------------------------
+        if [[ "$failed" == "true" ]]; then
+          status="Failed"
+        elif [[ "$DRY_RUN" == "true" ]]; then
+          status="Validated"
+        else
+          status="Deployed"
+        fi
+
+        {
+          echo "exclude="
+          echo "status=$status"
+          echo "published=$(join_list ${published[@]+"${published[@]}"})"
+          echo "unchanged=$(join_list ${unchanged[@]+"${unchanged[@]}"})"
+          echo "activated=$(join_list ${activated[@]+"${activated[@]}"})"
+        } >> "$GITHUB_OUTPUT"
+
+        # ---------------------------- Step summary ----------------------------
+        if [[ "$STEP_SUMMARY" == "true" ]]; then
+          [[ "$failed" == "true" ]] && icon="❌" || icon="🤖"
+          {
+            echo ""
+            echo "### ${icon} Agents: ${status}"
+            echo ""
+            if [[ ${#rows[@]} -gt 0 ]]; then
+              echo "| Agent | Result | Active version |"
+              echo "| ----- | ------ | -------------- |"
+              printf '%s\n' "${rows[@]}"
+              echo ""
+            fi
+            if [[ -n "$follow_up_state" ]]; then
+              echo "- **Agent tests and post-publish directories:** ${follow_up_state}"
+              echo ""
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+        fi
+
+        [[ "$failed" == "true" ]] && exit 1
+        exit 0
