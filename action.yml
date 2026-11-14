@@ -13,6 +13,13 @@ inputs:
       activates (or, on a dry-run, validates) the agents and deploys their tests.
     required: false
     default: publish
+  working-directory:
+    description: >
+      Folder of the Salesforce project, the one holding sfdx-project.json, relative to the workspace, e.g.
+      "projects/crm". The action runs there, so source-dir and post-publish-dir are relative to it. Use the
+      same value as for sfdx-deploy.
+    required: false
+    default: .
   source-dir:
     description: Source directories to look for agents and agent tests in, as a comma-separated or multi-line list, e.g. "force-app,my-other-app".
     required: false
@@ -73,7 +80,9 @@ runs:
     - name: Deploy Agents
       id: agents
       shell: bash
+      working-directory: ${{ inputs.working-directory }}
       env:
+        WORKING_DIRECTORY: ${{ inputs.working-directory }}
         PHASE: ${{ inputs.phase }}
         SOURCE_DIR: ${{ inputs.source-dir }}
         TARGET_ORG: ${{ inputs.target-org }}
@@ -210,6 +219,18 @@ runs:
           } >> "$GITHUB_OUTPUT"
           exit 0
         fi
+
+        # Publishing, validating and deploying only work inside a project.
+        if [[ ! -f sfdx-project.json ]]; then
+          echo "::error::No sfdx-project.json in '${WORKING_DIRECTORY}'. Set the working-directory input to the folder of the Salesforce project."
+          exit 1
+        fi
+
+        # Annotations name a file by its path in the workspace, not in the project.
+        project_path=""
+        case "$PWD" in
+          "${GITHUB_WORKSPACE%/}"/*) project_path="${PWD#"${GITHUB_WORKSPACE%/}"/}" ;;
+        esac
 
         # Highest version of a compiled agent held in the source, empty if none.
         latest_source_version() {
@@ -436,7 +457,7 @@ runs:
             # counts its own publishes. Without one, the active version is tested.
             for meta in ${test_files[@]+"${test_files[@]}"}; do
               if grep -q '<subjectVersion>' "$meta"; then
-                echo "::warning file=$meta::$(basename "$meta") pins a subjectVersion, but version numbers differ between orgs. Remove it to test the active version."
+                echo "::warning file=${project_path:+$project_path/}$meta::$(basename "$meta") pins a subjectVersion, but version numbers differ between orgs. Remove it to test the active version."
               fi
             done
 
