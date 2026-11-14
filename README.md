@@ -49,21 +49,21 @@ jobs:
 
       - name: Prepare Agents
         id: agents
-        uses: svierk/sfdx-agent-deploy@v1.0.1
+        uses: svierk/sfdx-agent-deploy@v1.1.0
         with:
           phase: prepare
           source-dir: force-app
           target-org: awesome-org
 
       - name: Deploy Metadata
-        uses: svierk/sfdx-deploy@v1.4.0
+        uses: svierk/sfdx-deploy@v1.6.0
         with:
           source-dir: force-app
           exclude: ${{ steps.agents.outputs.exclude }}
           target-org: awesome-org
 
       - name: Deploy Agents
-        uses: svierk/sfdx-agent-deploy@v1.0.1
+        uses: svierk/sfdx-agent-deploy@v1.1.0
         with:
           source-dir: force-app
           target-org: awesome-org
@@ -80,13 +80,13 @@ The following actions were also used in the example workflow to create the prere
 ```yaml
 - name: Prepare Agents
   id: agents
-  uses: svierk/sfdx-agent-deploy@v1.0.1
+  uses: svierk/sfdx-agent-deploy@v1.1.0
   with:
     phase: prepare
     target-org: ci
 
 - name: Validate Deployment
-  uses: svierk/sfdx-deploy@v1.4.0
+  uses: svierk/sfdx-deploy@v1.6.0
   with:
     source-dir: force-app
     exclude: ${{ steps.agents.outputs.exclude }}
@@ -94,7 +94,7 @@ The following actions were also used in the example workflow to create the prere
     dry-run: true
 
 - name: Validate Agents
-  uses: svierk/sfdx-agent-deploy@v1.0.1
+  uses: svierk/sfdx-agent-deploy@v1.1.0
   with:
     target-org: ci
     dry-run: true
@@ -102,13 +102,43 @@ The following actions were also used in the example workflow to create the prere
 
 On a dry-run, the action only compiles the Agent Script of the draft bundles. Nothing is saved or activated.
 
+### Project in a subfolder
+
+If the Salesforce project, the folder holding `sfdx-project.json`, is not at the root of the workspace, give both steps of this action and SFDX Deploy the same `working-directory`. `source-dir` and `post-publish-dir` are then relative to it:
+
+```yaml
+- name: Prepare Agents
+  id: agents
+  uses: svierk/sfdx-agent-deploy@v1.1.0
+  with:
+    phase: prepare
+    working-directory: projects/crm
+    target-org: awesome-org
+
+- name: Deploy Metadata
+  uses: svierk/sfdx-deploy@v1.6.0
+  with:
+    working-directory: projects/crm
+    source-dir: force-app
+    exclude: ${{ steps.agents.outputs.exclude }}
+    target-org: awesome-org
+
+- name: Deploy Agents
+  uses: svierk/sfdx-agent-deploy@v1.1.0
+  with:
+    working-directory: projects/crm
+    target-org: awesome-org
+```
+
+Without agents or agent tests in the source, the action skips as usual. With them, it fails if the folder holds no `sfdx-project.json`.
+
 ### Run the agent tests
 
 Agent tests are a test type of [SFDX Run Tests](https://github.com/svierk/sfdx-run-tests), which judges the result of each test case:
 
 ```yaml
 - name: Run Agent Tests
-  uses: svierk/sfdx-run-tests@v1.4.0
+  uses: svierk/sfdx-run-tests@v1.5.0
   with:
     apex: false
     agent: true
@@ -132,6 +162,7 @@ The action uses `--skip-retrieve` when publishing, as CI would only download the
 | Name               | Required | Default     | Description                                                                                                                                                                                                                              |
 | ------------------ | -------- | ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `phase`            | no       | `publish`   | `prepare` runs **before** SFDX Deploy and outputs what the deployment has to leave out. `publish` runs **after** it.                                                                                                                       |
+| `working-directory` | no      | `.`         | Folder of the Salesforce project (holding `sfdx-project.json`), relative to the workspace. `source-dir` and `post-publish-dir` are relative to it. Use the same value as for SFDX Deploy. See [Project in a subfolder](#project-in-a-subfolder). |
 | `source-dir`       | no       | `force-app` | Source directories to look for agents and agent tests in, comma-separated or multi-line.                                                                                                                                                   |
 | `target-org`       | no       |             | Username or alias of the target org. Not required if the default org is set.                                                                                                                                                               |
 | `dry-run`          | no       | `false`     | Only compile the Agent Script of the draft bundles. Nothing is saved, activated or deployed.                                                                                                                                               |
